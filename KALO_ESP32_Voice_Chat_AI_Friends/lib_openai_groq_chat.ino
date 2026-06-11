@@ -280,17 +280,28 @@ String OpenAI_Groq_LLM( String UserRequest, const char* llm_open_key, bool flg_W
 
     // Define YOUR preferred models here:
 
-    if (llm_groq_key == "" || flg_WebSearch)                          // using #OPEN AI# only for web search (or if no GROQ Key)
+    // NEW: 60db opt-in via global SIXTYDB_KEY (declared in main .ino). When set AND no websearch requested, route to 60db.
+    // 60db is OpenAI-compatible at /v1/chat/completions so the rest of this function is unchanged.
+    // Reference: https://docs.60db.ai/api-reference/llm/chat-completion
+    extern const char* SIXTYDB_KEY;  // forward decl — value lives in the main .ino
+
+    if (SIXTYDB_KEY != NULL && strlen(SIXTYDB_KEY) > 5 && !flg_WebSearch)
+    {  LLM_server =        "api.60db.ai";
+       LLM_entrypoint =    "/v1/chat/completions";
+       LLM_model =         "60db-tiny";
+       LLM_key =           SIXTYDB_KEY;
+    }
+    else if (llm_groq_key == "" || flg_WebSearch)                     // using #OPEN AI# only for web search (or if no GROQ Key)
     {  LLM_server =        "api.openai.com";                          // OpenAI: https://platform.openai.com/docs/pricing
-       LLM_entrypoint =    "/v1/chat/completions";           
-       if (!flg_WebSearch) LLM_model= "gpt-4.1-nano";                 // low cost, powerful, fast (response latency ~ 1.5 sec)  
-       if (flg_WebSearch)  LLM_model= "gpt-4o-mini-search-preview";   // realtime websearch model (higher latency ~ 3-5 sec)     
+       LLM_entrypoint =    "/v1/chat/completions";
+       if (!flg_WebSearch) LLM_model= "gpt-4.1-nano";                 // low cost, powerful, fast (response latency ~ 1.5 sec)
+       if (flg_WebSearch)  LLM_model= "gpt-4o-mini-search-preview";   // realtime websearch model (higher latency ~ 3-5 sec)
        LLM_key =           llm_open_key;
-    }  
+    }
     else
     {  LLM_server =        "api.groq.com";                            // Chat DEFAULT: using #CROG# with fastest llame model
        LLM_entrypoint =    "/openai/v1/chat/completions";             // GROQ Models/Pricing: https://groq.com/pricing
-       LLM_model =         "llama-3.1-8b-instant";                    // low cost, very FAST (response latency ~ 0.5-1 sec !)  
+       LLM_model =         "llama-3.1-8b-instant";                    // low cost, very FAST (response latency ~ 0.5-1 sec !)
        LLM_key =           llm_groq_key;
     }
      

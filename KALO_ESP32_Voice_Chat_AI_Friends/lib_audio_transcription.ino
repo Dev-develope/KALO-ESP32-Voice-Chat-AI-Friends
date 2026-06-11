@@ -532,7 +532,115 @@ String json_object( String input, String element )
      } content.trim();                                    // remove optional spaces between the json objects
      if (content.startsWith("\""))                        // String objects typically start & end with quotation marks "    
      { content=content.substring(1,content.length()-1);   // remove both existing quotation marks (if exist)
-     }     
-  }  
+     }
+  }
   return (content);
+}
+
+
+// ------------------------------------------------------------------------------------------------------------------------------
+// SpeechToText_60db( String audio_filename, uint8_t* PSRAM, long PSRAM_length, String language, const char* API_Key )
+// ------------------------------------------------------------------------------------------------------------------------------
+// 60db cloud STT — mirrors SpeechToText_ElevenLabs() signature so the call sites in the main .ino can swap providers freely.
+// Endpoint: api.60db.ai/stt   Auth: Authorization: Bearer <SIXTYDB_KEY>   Payload: multipart/form-data (file + optional language)
+// Reference: https://docs.60db.ai/api-reference/stt/speech-to-text
+//
+// Same 16383-byte chunked-write trick as the ElevenLabs path (WiFiClientSecure has a ~14-bit max single write on ESP32).
+// Same static-client + setNoDelay + PSRAM-aware close policy.
+
+String SpeechToText_60db( String audio_filename, uint8_t* PSRAM, long PSRAM_length, String language, const char* API_Key )
+{
+  static WiFiClientSecure client;
+  uint32_t t_start = millis();
+
+  const char* STT_ENDPOINT = "api.60db.ai";
+  if ( !client.connected() )
+  { DebugPrintln("> Initialize 60db Server connection ... ");
+    client.setInsecure();
+    if (!client.connect(STT_ENDPOINT, 443))
+    { Serial.println("\n* ERROR - WifiClientSecure connection to 60db Server failed!");
+      client.stop();
+      return ("");
+    }
+    DebugPrintln("Done. Connected to 60db Server.");
+  }
+  client.setNoDelay(true);
+  uint32_t t_connected = millis();
+
+  size_t audio_size;
+  if ( PSRAM != NULL && PSRAM_length > 0 ) { audio_size = PSRAM_length; }
+  else
+  { File audioFile = SD.open( audio_filename );
+    audio_size = audioFile.size();
+    audioFile.close();
+    DebugPrintln( "> Audio File [" + audio_filename + "] found, size: " + (String) audio_size );
+  }
+  if (audio_size == 0) { DebugPrintln( "* ERROR - No AUDIO data for transcription found!" ); return (""); }
+
+  String boundary = "---011000010111000001101001";
+  String bond     = "--" + boundary + "\r\n" + "Content-Disposition: form-data; ";
+  String payload_header  = (language != "") ? (bond + "name=\"language\"\r\n\r\n" + language + "\r\n") : "";
+  payload_header        += bond + "name=\"file\"; filename=\"audio.wav\"\r\n" + "Content-Type: audio/wav\r\n\r\n";
+  String payload_end     = "\r\n--" + boundary + "--\r\n";
+  size_t total_length    = payload_header.length() + audio_size + payload_end.length();
+
+  client.println("POST /stt HTTP/1.1");
+  client.println("Host: " + (String) STT_ENDPOINT);
+  client.println("Authorization: Bearer " + String(API_Key));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.println("Content-Length: " + String(total_length));
+  client.println();
+  client.print(payload_header);
+
+  DebugPrintln("> POST Request to 60db Server started, sending WAV data now ...");
+
+  if (PSRAM != NULL && PSRAM_length > 0)
+  { size_t blocksize = 16383, chunk_start = 0;
+    while ( chunk_start < (size_t)PSRAM_length )
+    { if ( (chunk_start + blocksize) > (size_t)PSRAM_length ) blocksize = PSRAM_length - chunk_start;
+      client.write( PSRAM + chunk_start, blocksize );
+      chunk_start += blocksize;
+    }
+    DebugPrintln( "> All WAV data in PSRAM sent [" + (String) PSRAM_length + " bytes]" );
+  }
+  else if ( audio_filename != "" )
+  { File audioFile = SD.open( audio_filename );
+    if (audioFile)
+    { const size_t bufsize = 1024;
+      uint8_t buf[bufsize];
+      while (audioFile.available())
+      { size_t n = audioFile.read(buf, bufsize);
+        client.write(buf, n);
+      }
+      audioFile.close();
+    }
+  }
+  client.print( payload_end );
+  uint32_t t_wavbodysent = millis();
+
+  String response = "";
+  uint32_t timeout = millis();
+  while ( client.connected() && (millis() - timeout) < 20000 )
+  { if (client.available())
+    { String line = client.readStringUntil('\n');
+      response += line + "\n";
+      if (line.indexOf("\"text\"") >= 0) { timeout = millis() - 19500; }  // body received → short remaining wait
+    }
+    delay(1);
+  }
+  uint32_t t_response = millis();
+  if ( ESP.getPsramSize() == 0 ) { client.stop(); }
+
+  String transcription = json_object( response, "\"text\":" );
+
+  DebugPrintln( "\n---------------------------------------------------" );
+  DebugPrintln( "60db STT (multi-lingual auto-detect)" );
+  DebugPrintln( "-> Latency Server (Re)CONNECT [t_connected]:   " + (String) ((float)((t_connected-t_start))/1000) );
+  DebugPrintln( "-> Latency sending WAV file [t_wavbodysent]:   " + (String) ((float)((t_wavbodysent-t_connected))/1000) );
+  DebugPrintln( "-> Latency 60db response [t_response]:         " + (String) ((float)((t_response-t_wavbodysent))/1000) );
+  DebugPrintln( "=> TOTAL Duration [sec]: ..................... " + (String) ((float)((t_response-t_start))/1000) );
+  DebugPrintln( "=> Transcription: [" + transcription + "]" );
+  DebugPrintln( "---------------------------------------------------\n" );
+
+  return transcription;
 }

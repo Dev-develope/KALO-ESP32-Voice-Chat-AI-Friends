@@ -80,7 +80,13 @@ const char* password =           "...";   // ### INSERT your password     [manda
 const char* OPENAI_KEY =         "...";   // LLM & TTS  - ### INSERT your OpenAI API KEY     [mandatory]
 const char* GROQ_KEY =           "...";   // LLM (fast) - ### INSERT your GroqCloud API KEY  [mandatory]
 const char* ELEVENLABS_KEY =     "...";   // STT (fast) - ### INSERT your ElevenLabs KEY     [mandatory]
-const char* DEEPGRAM_KEY =       "";      // STT (slow) - ### INSERT your Deepgram KEY       [optional]   
+const char* DEEPGRAM_KEY =       "";      // STT (slow) - ### INSERT your Deepgram KEY       [optional]
+const char* SIXTYDB_KEY =        "";      // STT/LLM/TTS - ### INSERT your 60db API KEY      [optional]
+                                          // When set: LLM auto-routes to api.60db.ai/v1/chat/completions (60db-tiny). For STT/TTS
+                                          // call SpeechToText_60db()/TextToSpeech_60db() instead of the ElevenLabs/OpenAI variants.
+                                          // Reference: https://docs.60db.ai
+#define USE_60DB_STT             false    // toggle: true → use SpeechToText_60db() instead of ElevenLabs (requires SIXTYDB_KEY)
+#define USE_60DB_TTS             false    // toggle: true → use TextToSpeech_60db() instead of OpenAI (requires SIXTYDB_KEY + SD)
 
  
 // === user settings =========== 
@@ -212,6 +218,8 @@ bool   Recording_Stop( String* filename, uint8_t** buff_start, long* audiolength
 
 String SpeechToText_Deepgram(   String audio_filename, uint8_t* PSRAM, long PSRAM_length, String language, const char* API_Key );
 String SpeechToText_ElevenLabs( String audio_filename, uint8_t* PSRAM, long PSRAM_length, String language, const char* API_Key );
+String SpeechToText_60db(       String audio_filename, uint8_t* PSRAM, long PSRAM_length, String language, const char* API_Key );
+void   TextToSpeech_60db(       String text );
 
 String OpenAI_Groq_LLM( String UserRequest, const char* llm_open_key, bool flg_WebSearch, const char* llm_groq_key );
 void   get_tts_param( int* id, String* names, String* model, String* voice, String* vspeed, String* inst, String* hello );
@@ -407,7 +415,10 @@ void loop()
            // using ElevenLabs STT as default (best performance, multi-lingual, high accuracy (language & word detection)
            // Reminder: as longer the spoken sentence, as better the results in language and word detection ;)
            
-           UserRequest = SpeechToText_ElevenLabs( record_SDfile, record_buffer, record_bytes, "", ELEVENLABS_KEY );
+           // Toggle USE_60DB_STT in the credentials block above to route to 60db /stt instead of ElevenLabs scribe_v1.
+           if (USE_60DB_STT && strlen(SIXTYDB_KEY) > 5)
+                UserRequest = SpeechToText_60db(       record_SDfile, record_buffer, record_bytes, "", SIXTYDB_KEY );
+           else UserRequest = SpeechToText_ElevenLabs( record_SDfile, record_buffer, record_bytes, "", ELEVENLABS_KEY );
            /* // alternatives (for user with DEEPGRAM API key):
            // MULTI-lingual:   .. = SpeechToText_Deepgram( record_SDfile, record_buffer, record_bytes, "",   DEEPGRAM_KEY );
            // Single language: .. = SpeechToText_Deepgram( record_SDfile, record_buffer, record_bytes, "en", DEEPGRAM_KEY );*/
@@ -692,8 +703,12 @@ void audio_info(const char *info)
 // - IMPORTANT: Be aware of AUDIO.H dependency -> CHECK bottom line (UPDATE in case older AUDIO.H used) to avoid COMPILER ERRORS!
 // ------------------------------------------------------------------------------------------------------------------------------
 
-void TextToSpeech( String p_request ) 
-{   
+void TextToSpeech( String p_request )
+{
+   // 60db TTS opt-in: when USE_60DB_TTS is true and SIXTYDB_KEY is present, hand off to TextToSpeech_60db().
+   // 60db has no AUDIO.H integration, so the helper saves the rendered mp3 to SD then plays via audio_play.connecttoFS().
+   if (USE_60DB_TTS && strlen(SIXTYDB_KEY) > 5) { TextToSpeech_60db(p_request); return; }
+
    // OpenAI voices are multi-lingual :) .. 9 tts-1 voices (August 2025): alloy|ash|coral|echo|fable|onyx|nova|sage|shimmer
    // Supported audio formats (response): aac | mp3 | wav (sample rate issue) | flac (PSRAM needed) 
    // Known AUDIO.H issue: Latency delay (~1 sec) before voice starts speaking (performance improved with latest AUDIO.H) 
@@ -749,8 +764,101 @@ void TextToSpeech( String p_request )
    // - choose the correct amout of parameter to avoid COMPILATION ERRORS (and set the wrong one into comment) .. */
    // ==> So CHECK your AUDIO.H library & update this last line in code if needed ! .... 
 
-   audio_play.openai_speech( OPENAI_KEY, model, p_request, instruction, voice, "aac", vspeed);  // <- use if version >= 3.1.0u 
+   audio_play.openai_speech( OPENAI_KEY, model, p_request, instruction, voice, "aac", vspeed);  // <- use if version >= 3.1.0u
 /* audio_play.openai_speech( OPENAI_KEY, model, p_request,              voice, "aac", vspeed);  // <- use this for 3.0.11g ! */
- 
+
+}
+
+
+// ------------------------------------------------------------------------------------------------------------------------------
+// TextToSpeech_60db( String text ) — 60db cloud TTS via /tts-synthesize
+// ------------------------------------------------------------------------------------------------------------------------------
+// Workflow: POST /tts-synthesize → JSON response with base64 mp3 → decode → write "/60db_tts.mp3" on SD → audio_play.connecttoFS()
+//
+// Requires SD card (AUDIO.H has no buffer-playback that matches our installed version, but connecttoFS is universally available).
+// For PSRAM-only boards, a future enhancement could swap to connecttoFS(SDMMC, ...) or stream from PROGMEM.
+//
+// Reference: https://docs.60db.ai/api-reference/tts/text-to-speech
+// ------------------------------------------------------------------------------------------------------------------------------
+
+void TextToSpeech_60db( String text )
+{
+   if (strlen(SIXTYDB_KEY) < 6) { Serial.println("* TextToSpeech_60db: SIXTYDB_KEY not set"); return; }
+
+   const char* TTS_ENDPOINT = "api.60db.ai";
+   const char* TTS_VOICE    = "fbb75ed2-975a-40c7-9e06-38e30524a9a1";  // 60db docs example voice; override as needed
+   const char* TTS_FILENAME = "/60db_tts.mp3";
+
+   WiFiClientSecure client;
+   client.setInsecure();
+   if (!client.connect(TTS_ENDPOINT, 443))
+   { Serial.println("* TextToSpeech_60db: connection to api.60db.ai failed"); return; }
+   client.setNoDelay(true);
+
+   // Escape double-quotes in the user text so the JSON body stays valid.
+   String safe = text;
+   safe.replace("\\", "\\\\");
+   safe.replace("\"", "\\\"");
+   String body = "{\"text\":\"" + safe + "\",\"voice_id\":\"" + TTS_VOICE +
+                 "\",\"enhance\":true,\"speed\":1,\"stability\":50,\"similarity\":75,\"output_format\":\"mp3\"}";
+
+   client.println("POST /tts-synthesize HTTP/1.1");
+   client.println("Host: " + (String)TTS_ENDPOINT);
+   client.println("Authorization: Bearer " + String(SIXTYDB_KEY));
+   client.println("Content-Type: application/json");
+   client.println("Content-Length: " + String(body.length()));
+   client.println();
+   client.print(body);
+
+   // Read whole response (60db TTS response is small JSON; full buffer is fine here).
+   String response = "";
+   uint32_t timeout = millis();
+   while ( client.connected() && (millis() - timeout) < 30000 )
+   { if (client.available())
+     { String line = client.readStringUntil('\n');
+       response += line + "\n";
+       if (line.indexOf("\"audio_base64\"") >= 0) { timeout = millis() - 28000; }
+     }
+     delay(1);
+   }
+   client.stop();
+
+   // Extract audio_base64 — simple substring grab (matching the json_object pattern used elsewhere).
+   int p = response.indexOf("\"audio_base64\"");
+   if (p < 0) { Serial.println("* TextToSpeech_60db: no audio_base64 in response"); return; }
+   int q1 = response.indexOf("\"", p + 14);
+   int q2 = response.indexOf("\"", q1 + 1);
+   if (q1 < 0 || q2 < 0) { Serial.println("* TextToSpeech_60db: malformed audio_base64 field"); return; }
+   String b64 = response.substring(q1 + 1, q2);
+
+   // Decode base64 → SD file. Standard 4→3 byte decoder.
+   // Remove any previous file first — older arduino-esp32 SD cores open FILE_WRITE in APPEND mode, which would corrupt the mp3.
+   if (SD.exists(TTS_FILENAME)) SD.remove(TTS_FILENAME);
+   File f = SD.open(TTS_FILENAME, FILE_WRITE);
+   if (!f) { Serial.println("* TextToSpeech_60db: SD open failed"); return; }
+   static const int8_t b64table[128] = {
+     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+     52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,
+     -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+     15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+     -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+     41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1 };
+   int n = b64.length();
+   for (int i = 0; i < n; i += 4)
+   { int v0 = (i   < n) ? b64table[(uint8_t)b64[i]]     : 0;
+     int v1 = (i+1 < n) ? b64table[(uint8_t)b64[i+1]]   : 0;
+     int v2 = (i+2 < n) ? b64table[(uint8_t)b64[i+2]]   : 0;
+     int v3 = (i+3 < n) ? b64table[(uint8_t)b64[i+3]]   : 0;
+     if (v0 < 0 || v1 < 0) break;
+     f.write((uint8_t)((v0 << 2) | (v1 >> 4)));
+     if (v2 >= 0 && b64[i+2] != '=') f.write((uint8_t)(((v1 & 0xF) << 4) | (v2 >> 2)));
+     if (v3 >= 0 && b64[i+3] != '=') f.write((uint8_t)(((v2 & 0x3) << 6) | v3));
+   }
+   f.close();
+
+   Serial.println("> 60db TTS mp3 saved to " + String(TTS_FILENAME) + " — playing via AUDIO.H ...");
+   audio_play.connecttoFS(SD, TTS_FILENAME);
 }
 
